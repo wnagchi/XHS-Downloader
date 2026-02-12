@@ -98,6 +98,7 @@ class DataRecorder(IDRecorder):
         ("作品链接", "TEXT"),
         ("下载地址", "TEXT"),
         ("动图地址", "TEXT"),
+        ("本地文件路径", "TEXT"),
     )
 
     def __init__(self, manager: "Manager"):
@@ -113,7 +114,18 @@ class DataRecorder(IDRecorder):
         await self.database.execute(f"""CREATE TABLE IF NOT EXISTS explore_data (
         {",".join(" ".join(i) for i in self.DATA_TABLE)}
         );""")
+        await self.__compatible_columns()
         await self.database.commit()
+
+    async def __compatible_columns(self):
+        await self.cursor.execute("PRAGMA table_info(explore_data);")
+        columns = {i[1] for i in await self.cursor.fetchall()}
+        for name, type_ in self.DATA_TABLE:
+            if name not in columns:
+                await self.database.execute(
+                    f"""ALTER TABLE explore_data
+                    ADD COLUMN "{name}" {type_};"""
+                )
 
     async def select(self, id_: str):
         pass
@@ -124,7 +136,7 @@ class DataRecorder(IDRecorder):
                 f"""REPLACE INTO explore_data (
         {", ".join(i[0] for i in self.DATA_TABLE)}
         ) VALUES (
-        {", ".join("?" for _ in kwargs)}
+        {", ".join("?" for _ in self.DATA_TABLE)}
         );""",
                 self.__generate_values(kwargs),
             )
@@ -140,7 +152,7 @@ class DataRecorder(IDRecorder):
         pass
 
     def __generate_values(self, data: dict) -> tuple:
-        return tuple(data[i] for i, _ in self.DATA_TABLE)
+        return tuple(data.get(i, "") for i, _ in self.DATA_TABLE)
 
 
 class MapRecorder(IDRecorder):

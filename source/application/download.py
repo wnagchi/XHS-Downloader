@@ -1,6 +1,6 @@
 from asyncio import Semaphore, gather
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from aiofiles import open
 from httpx import HTTPError
@@ -77,7 +77,7 @@ class Download:
         filename: str,
         type_: str,
         mtime: int,
-    ) -> tuple[Path, list[Any]]:
+    ) -> tuple[Path, list[bool], list[str]]:
         path = self.__generate_path(nickname, filename)
         if type_ == _("视频"):
             tasks = self.__ready_download_video(
@@ -109,7 +109,11 @@ class Download:
             for url, name, format_ in tasks
         ]
         tasks = await gather(*tasks)
-        return path, tasks  # 未解之谜
+        return (
+            path,
+            [success for success, __ in tasks],
+            [str(real) for success, real in tasks if success and real],
+        )
 
     def __generate_path(self, nickname: str, filename: str):
         if self.author_archive:
@@ -201,7 +205,7 @@ class Download:
         name: str,
         format_: str,
         mtime: int,
-    ):
+    ) -> tuple[bool, Path | None]:
         async with self.SEMAPHORE:
             headers = self.headers.copy()
             temp = self.temp.joinpath(f"{name}.{format_}")
@@ -246,7 +250,7 @@ class Download:
                 )
                 # self.__create_progress(bar, None)
                 logging(self.print, _("文件 {0} 下载成功").format(real.name))
-                return True
+                return True, real
             except HTTPError as error:
                 # self.__create_progress(bar, None)
                 logging(
@@ -256,7 +260,7 @@ class Download:
                     ),
                     ERROR,
                 )
-                return False
+                return False, None
             except CacheError as error:
                 self.manager.delete(temp)
                 logging(
@@ -264,7 +268,7 @@ class Download:
                     str(error),
                     ERROR,
                 )
-                return False
+                return False, None
 
     @staticmethod
     def __create_progress(

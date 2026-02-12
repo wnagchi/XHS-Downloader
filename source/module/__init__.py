@@ -1,8 +1,15 @@
 from .extend import Account
 from .manager import Manager
 from .model import (
+    BatchDownloadParams,
+    DownloadShareParams,
+    DownloadShareResponse,
+    DownloadStatistics,
     ExtractData,
     ExtractParams,
+    SQLiteDataResponse,
+    TaskAcceptedResponse,
+    TaskStatusResponse,
 )
 from .recorder import DataRecorder
 from .recorder import IDRecorder
@@ -40,3 +47,4 @@ from .tools import (
     retry_limited,
 )
 from .script import ScriptServer
+from .task_manager import TaskManager

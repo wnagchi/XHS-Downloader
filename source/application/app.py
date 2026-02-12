@@ -10,10 +10,11 @@ from asyncio import (
 )
 from contextlib import suppress
 from datetime import datetime
+from json import dumps
 from re import compile
 from urllib.parse import urlparse
 from textwrap import dedent
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Path
 from fastapi.responses import RedirectResponse
 from fastmcp import FastMCP
 from typing import Annotated
@@ -31,6 +32,14 @@ from ..expansion import (
     beautify_string,
 )
 from ..module import (
+    BatchDownloadParams,
+    DownloadShareParams,
+    DownloadShareResponse,
+    DownloadStatistics,
+    SQLiteDataResponse,
+    TaskAcceptedResponse,
+    TaskManager,
+    TaskStatusResponse,
     __VERSION__,
     ERROR,
     MASTER,
@@ -58,6 +67,7 @@ from .download import Download
 from .explore import Explore
 from .image import Image
 from .request import Html
+from .user_posted import UserPosted
 from .video import Video
 from rich import print
 
@@ -72,12 +82,14 @@ def data_cache(function):
         if self.manager.record_data:
             download = data["下载地址"]
             lives = data["动图地址"]
+            local = data.get("本地文件路径", [])
             await function(
                 self,
                 data,
             )
             data["下载地址"] = download
             data["动图地址"] = lives
+            data["本地文件路径"] = local
 
     return inner
 
@@ -101,10 +113,43 @@ class XHS:
     VERSION_BETA = VERSION_BETA
     LINK = compile(r"(?:https?://)?www\.xiaohongshu\.com/explore/\S+")
     USER = compile(r"(?:https?://)?www\.xiaohongshu\.com/user/profile/[a-z0-9]+/\S+")
+    PROFILE = compile(
+        r"(?:https?://)?(?:www\.)?xiaohongshu\.com/user/profile/([a-zA-Z0-9]+)"
+    )
     SHARE = compile(r"(?:https?://)?www\.xiaohongshu\.com/discovery/item/\S+")
     SHORT = compile(r"(?:https?://)?xhslink\.com/[^\s\"<>\\^`{|}，。；！？、【】《》]+")
     ID = compile(r"(?:explore|item)/(\S+)?\?")
     ID_USER = compile(r"user/profile/[a-z0-9]+/(\S+)?\?")
+    SQLITE_FIELD_MAP = {
+        "explore_data": {
+            "采集时间": "collected_at",
+            "作品ID": "note_id",
+            "作品类型": "note_type",
+            "作品标题": "title",
+            "作品描述": "description",
+            "作品标签": "tags",
+            "发布时间": "published_at",
+            "最后更新时间": "updated_at",
+            "收藏数量": "favorite_count",
+            "评论数量": "comment_count",
+            "分享数量": "share_count",
+            "点赞数量": "like_count",
+            "作者昵称": "author_nickname",
+            "作者ID": "author_id",
+            "作者链接": "author_url",
+            "作品链接": "note_url",
+            "下载地址": "download_urls",
+            "动图地址": "live_photo_urls",
+            "本地文件路径": "local_file_paths",
+        },
+        "explore_id": {
+            "ID": "note_id",
+        },
+        "mapping_data": {
+            "ID": "author_id",
+            "NAME": "author_name",
+        },
+    }
     __INSTANCE = None
     CLEANER = Cleaner()
 
@@ -183,6 +228,7 @@ class XHS:
         self.download = Download(self.manager)
         self.id_recorder = IDRecorder(self.manager)
         self.data_recorder = DataRecorder(self.manager)
+        self.task_manager = TaskManager()
         self.clipboard_cache: str = ""
         self.queue = Queue()
         self.event = Event()
@@ -218,12 +264,13 @@ class XHS:
         count: SimpleNamespace,
     ):
         name = self.__naming_rules(container)
+        container["本地文件路径"] = []
         if (u := container["下载地址"]) and download:
             if await self.skip_download(i := container["作品ID"]):
                 self.logging(_("作品 {0} 存在下载记录，跳过下载").format(i))
                 count.skip += 1
             else:
-                __, result = await self.download.run(
+                __, result, local_paths = await self.download.run(
                     u,
                     container["动图地址"],
                     index,
@@ -234,6 +281,7 @@ class XHS:
                     container["作品类型"],
                     container["时间戳"],
                 )
+                container["本地文件路径"] = local_paths
                 if not result:
                     count.skip += 1
                 elif all(result):
@@ -256,6 +304,7 @@ class XHS:
         data["采集时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         data["下载地址"] = " ".join(data["下载地址"])
         data["动图地址"] = " ".join(i or "NaN" for i in data["动图地址"])
+        data["本地文件路径"] = dumps(data.get("本地文件路径", []), ensure_ascii=False)
         data.pop("时间戳", None)
         await self.data_recorder.add(**data)
 
@@ -669,6 +718,62 @@ class XHS:
         await self.stop_script_server()
         await self.manager.close()
 
+    @staticmethod
+    def __rows_to_dicts(
+        columns: list[str],
+        rows: list[tuple],
+        field_map: dict[str, str] | None = None,
+    ) -> list[dict[str, object]]:
+        field_map = field_map or {}
+        data = []
+        for row in rows:
+            item = {}
+            for key, value in zip(columns, row):
+                item[field_map.get(key, key)] = value
+            data.append(item)
+        return data
+
+    async def __fetch_table_rows(
+        self,
+        database,
+        table: str,
+    ) -> list[dict[str, object]]:
+        cursor = await database.execute(f"SELECT * FROM {table};")
+        try:
+            rows = await cursor.fetchall()
+            columns = [i[0] for i in (cursor.description or ())]
+            return self.__rows_to_dicts(
+                columns,
+                rows,
+                self.SQLITE_FIELD_MAP.get(table),
+            )
+        finally:
+            await cursor.close()
+
+    async def get_sqlite_data(self) -> dict[str, list[dict]]:
+        if not all(
+            (
+                self.data_recorder.database,
+                self.id_recorder.database,
+                self.map_recorder.database,
+            )
+        ):
+            raise RuntimeError(_("数据库未初始化"))
+        return {
+            "explore_data": await self.__fetch_table_rows(
+                self.data_recorder.database,
+                "explore_data",
+            ),
+            "explore_id": await self.__fetch_table_rows(
+                self.id_recorder.database,
+                "explore_id",
+            ),
+            "mapping_data": await self.__fetch_table_rows(
+                self.map_recorder.database,
+                "mapping_data",
+            ),
+        }
+
     # @staticmethod
     # def read_browser_cookie(value: str | int) -> str:
     #     return (
@@ -716,6 +821,28 @@ class XHS:
         async def index():
             return RedirectResponse(url=REPOSITORY)
 
+        @server.get(
+            "/xhs/sqlite/data",
+            summary=_("获取 SQLite 存储数据"),
+            description=_("返回 SQLite 中已存储的作品记录、下载记录和映射数据"),
+            tags=["API"],
+            response_model=SQLiteDataResponse,
+        )
+        async def sqlite_data():
+            try:
+                data = await self.get_sqlite_data()
+            except RuntimeError as error:
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except Exception as error:
+                raise HTTPException(
+                    status_code=500,
+                    detail=_("读取 SQLite 数据失败：{0}").format(repr(error)),
+                ) from error
+            return SQLiteDataResponse(
+                message=_("获取 SQLite 数据成功"),
+                data=data,
+            )
+
         @server.post(
             "/xhs/detail",
             summary=_("获取作品数据及下载地址"),
@@ -747,13 +874,161 @@ class XHS:
                     extract.download,
                     extract.index,
                     not extract.skip,
-                    extract.cookie,
-                    extract.proxy,
+                    self._resolve_cookie(extract.cookie),
+                    self._resolve_proxy(extract.proxy),
                 ):
                     msg = _("获取小红书作品数据成功")
                 else:
                     msg = _("获取小红书作品数据失败")
             return ExtractData(message=msg, params=extract, data=data)
+
+        @server.post(
+            "/xhs/download/share",
+            summary=_("下载指定作品链接文件"),
+            description=_(
+                dedent("""
+                **参数**:
+
+                - **url**: 小红书作品链接或短链接；必填
+                - **index**: 指定下载图片序号，仅对图文作品生效；可选
+                - **cookie**: 本次请求使用的 Cookie；可选
+                - **proxy**: 本次请求使用的代理（http(s)/socks5）；可选
+                - **skip**: 是否跳过存在下载记录的作品；可选
+                """)
+            ),
+            tags=["API"],
+            response_model=DownloadShareResponse,
+        )
+        async def download_share_api(extract: DownloadShareParams):
+            message, data, stats = await self.download_share(extract)
+            return DownloadShareResponse(
+                message=message,
+                params=extract,
+                data=data,
+                stats=DownloadStatistics(**stats),
+            )
+
+        @server.post(
+            "/xhs/download/user-posted",
+            summary=_("下载发布者全部作品"),
+            description=_(
+                dedent("""
+                **参数**:
+
+                - **profile_url**: 发布者主页链接，支持手机端分享文案中的 `xhslink.com` 短链接；必填
+                - **cookie**: 本次请求使用的 Cookie；可选
+                - **proxy**: 本次请求使用的代理（http(s)/socks5）；可选
+                - **limit**: 最多处理作品数量；可选
+                """)
+            ),
+            tags=["API"],
+            response_model=TaskAcceptedResponse,
+        )
+        async def download_user_posted(params: BatchDownloadParams):
+            task_id = self.create_download_task(
+                mode="posted",
+                profile_url=params.profile_url,
+                cookie=params.cookie,
+                proxy=params.proxy,
+                limit=params.limit,
+                video_only=False,
+            )
+            return TaskAcceptedResponse(
+                message=_("批量下载任务已创建"),
+                task_id=task_id,
+                status_url=f"/xhs/tasks/{task_id}",
+            )
+
+        @server.post(
+            "/xhs/download/me-liked-videos",
+            summary=_("下载本人点赞视频"),
+            description=_(
+                dedent("""
+                **参数**:
+
+                - **profile_url**: 本人主页链接，支持手机端分享文案中的 `xhslink.com` 短链接；必填
+                - **cookie**: 本次请求使用的 Cookie；可选
+                - **proxy**: 本次请求使用的代理（http(s)/socks5）；可选
+                - **limit**: 最多处理作品数量；可选
+                """)
+            ),
+            tags=["API"],
+            response_model=TaskAcceptedResponse,
+        )
+        async def download_me_liked(params: BatchDownloadParams):
+            task_id = self.create_download_task(
+                mode="liked",
+                profile_url=params.profile_url,
+                cookie=params.cookie,
+                proxy=params.proxy,
+                limit=params.limit,
+                video_only=True,
+            )
+            return TaskAcceptedResponse(
+                message=_("批量下载任务已创建"),
+                task_id=task_id,
+                status_url=f"/xhs/tasks/{task_id}",
+            )
+
+        @server.post(
+            "/xhs/download/me-saved-videos",
+            summary=_("下载本人收藏视频"),
+            description=_(
+                dedent("""
+                **参数**:
+
+                - **profile_url**: 本人主页链接，支持手机端分享文案中的 `xhslink.com` 短链接；必填
+                - **cookie**: 本次请求使用的 Cookie；可选
+                - **proxy**: 本次请求使用的代理（http(s)/socks5）；可选
+                - **limit**: 最多处理作品数量；可选
+                """)
+            ),
+            tags=["API"],
+            response_model=TaskAcceptedResponse,
+        )
+        async def download_me_saved(params: BatchDownloadParams):
+            task_id = self.create_download_task(
+                mode="saved",
+                profile_url=params.profile_url,
+                cookie=params.cookie,
+                proxy=params.proxy,
+                limit=params.limit,
+                video_only=True,
+            )
+            return TaskAcceptedResponse(
+                message=_("批量下载任务已创建"),
+                task_id=task_id,
+                status_url=f"/xhs/tasks/{task_id}",
+            )
+
+        @server.get(
+            "/xhs/tasks/{task_id}",
+            summary=_("查询批量下载任务状态"),
+            description=_(
+                dedent("""
+                **路径参数**:
+
+                - **task_id**: 创建批量下载任务接口返回的任务 ID
+                """)
+            ),
+            tags=["API"],
+            response_model=TaskStatusResponse,
+        )
+        async def get_task_status(
+            task_id: Annotated[str, Path(description=_("批量下载任务 ID"))]
+        ):
+            if not (task := self.task_manager.get(task_id)):
+                raise HTTPException(status_code=404, detail=_("任务不存在"))
+            return TaskStatusResponse(
+                task_id=task["task_id"],
+                mode=task["mode"],
+                status=task["status"],
+                started_at=task["started_at"],
+                finished_at=task["finished_at"],
+                progress=DownloadStatistics(**task["progress"]),
+                summary=DownloadStatistics(**task["summary"]),
+                errors=task["errors"],
+            )
 
     async def run_mcp_server(
         self,
@@ -938,6 +1213,277 @@ class XHS:
         else:
             msg = _("获取小红书作品数据失败")
         return msg, data
+
+    @staticmethod
+    def _stats_to_dict(
+        stats: SimpleNamespace,
+        filtered: int = 0,
+    ) -> dict[str, int]:
+        return {
+            "all": int(stats.all),
+            "success": int(stats.success),
+            "fail": int(stats.fail),
+            "skip": int(stats.skip),
+            "filtered": int(filtered),
+        }
+
+    @classmethod
+    def extract_profile_id(
+        cls,
+        profile_url: str,
+    ) -> str:
+        return r.group(1) if (r := cls.PROFILE.search(profile_url)) else ""
+
+    async def resolve_profile_id(
+        self,
+        profile_url: str,
+        proxy: str | None = None,
+    ) -> str:
+        profile_url = (profile_url or "").strip()
+        if not profile_url:
+            return ""
+        if user_id := self.extract_profile_id(profile_url):
+            return user_id
+        if short := self.SHORT.search(profile_url):
+            if resolved := await self.html.request_url(
+                short.group(),
+                content=False,
+                proxy=proxy,
+                follow_redirects=True,
+            ):
+                if user_id := self.extract_profile_id(resolved):
+                    return user_id
+        return ""
+
+    @staticmethod
+    def _resolve_cookie(cookie: str | None) -> str | None:
+        if not cookie:
+            return None
+        if not isinstance(cookie, str):
+            return None
+        cookie = cookie.strip()
+        if not cookie or cookie.lower() == "string":
+            return None
+        return cookie
+
+    @staticmethod
+    def _resolve_proxy(proxy: str | None) -> str | None:
+        if not proxy:
+            return None
+        if not isinstance(proxy, str):
+            return None
+        proxy = proxy.strip()
+        if not proxy or proxy.lower() == "string":
+            return None
+        if proxy.startswith(
+            (
+                "http://",
+                "https://",
+                "socks5://",
+                "socks5h://",
+            )
+        ):
+            return proxy
+        return None
+
+    async def download_share(
+        self,
+        extract: DownloadShareParams,
+    ) -> tuple[str, dict | None, dict[str, int]]:
+        data = None
+        stats = SimpleNamespace(
+            all=1,
+            success=0,
+            fail=0,
+            skip=0,
+        )
+        url = await self.extract_links(
+            extract.url,
+        )
+        if not url:
+            msg = _("提取小红书作品链接失败")
+        elif data := await self.__deal_extract(
+            url[0],
+            True,
+            extract.index,
+            not extract.skip,
+            self._resolve_cookie(extract.cookie),
+            self._resolve_proxy(extract.proxy),
+            count=stats,
+        ):
+            msg = _("作品文件下载任务执行完毕")
+        else:
+            msg = _("作品文件下载任务未执行")
+        return msg, data, self._stats_to_dict(stats)
+
+    def create_download_task(
+        self,
+        mode: str,
+        profile_url: str,
+        cookie: str | None,
+        proxy: str | None,
+        limit: int | None,
+        video_only: bool,
+    ) -> str:
+        task_id = self.task_manager.create(mode)
+        create_task(
+            self._run_download_task(
+                task_id=task_id,
+                mode=mode,
+                profile_url=profile_url,
+                cookie=self._resolve_cookie(cookie),
+                proxy=self._resolve_proxy(proxy),
+                limit=limit,
+                video_only=video_only,
+            )
+        )
+        return task_id
+
+    async def _run_download_task(
+        self,
+        task_id: str,
+        mode: str,
+        profile_url: str,
+        cookie: str | None,
+        proxy: str | None,
+        limit: int | None,
+        video_only: bool,
+    ):
+        statistics = SimpleNamespace(
+            all=0,
+            success=0,
+            fail=0,
+            skip=0,
+        )
+        filtered = 0
+        try:
+            if not (user_id := await self.resolve_profile_id(profile_url, proxy)):
+                self.task_manager.fail(task_id, _("主页链接格式错误"))
+                return
+
+            loader = UserPosted(
+                self.manager,
+                cookie,
+                proxy,
+            )
+            links = await loader.run(
+                mode=mode,
+                user_id=user_id,
+                limit=limit,
+            )
+            statistics.all = len(links)
+            self.task_manager.mark_running(task_id, len(links))
+            if not links:
+                self.task_manager.complete(
+                    task_id,
+                    all_count=0,
+                    success=0,
+                    fail=0,
+                    skip=0,
+                    filtered=0,
+                )
+                return
+
+            for link in links:
+                try:
+                    is_filtered, error = await self._batch_deal_extract(
+                        link,
+                        cookie,
+                        proxy,
+                        video_only,
+                        statistics,
+                    )
+                    if is_filtered:
+                        filtered += 1
+                    if error:
+                        self.task_manager.add_error(task_id, error)
+                except Exception as error:
+                    statistics.fail += 1
+                    self.task_manager.add_error(
+                        task_id,
+                        _("{0} 下载失败：{1}").format(link, repr(error)),
+                    )
+                progress = self._stats_to_dict(
+                    statistics,
+                    filtered,
+                )
+                self.task_manager.update_progress(
+                    task_id,
+                    all_count=progress["all"],
+                    success=progress["success"],
+                    fail=progress["fail"],
+                    skip=progress["skip"],
+                    filtered=progress["filtered"],
+                )
+
+            summary = self._stats_to_dict(
+                statistics,
+                filtered,
+            )
+            self.task_manager.complete(
+                task_id,
+                all_count=summary["all"],
+                success=summary["success"],
+                fail=summary["fail"],
+                skip=summary["skip"],
+                filtered=summary["filtered"],
+            )
+        except Exception as error:
+            self.task_manager.fail(
+                task_id,
+                _("批量任务执行失败：{0}").format(repr(error)),
+                all_count=statistics.all,
+                success=statistics.success,
+                fail_count=statistics.fail,
+                skip=statistics.skip,
+                filtered=filtered,
+            )
+
+    async def _batch_deal_extract(
+        self,
+        url: str,
+        cookie: str | None,
+        proxy: str | None,
+        video_only: bool,
+        count: SimpleNamespace,
+    ) -> tuple[bool, str | None]:
+        id_, namespace = await self._get_html_data(
+            url,
+            True,
+            cookie,
+            proxy,
+            count,
+        )
+        if not isinstance(namespace, Namespace):
+            if message := namespace.get("message") if isinstance(namespace, dict) else None:
+                return False, message
+            return False, _("作品 {0} 处理失败").format(id_)
+
+        if not (
+            data := self._extract_data(
+                namespace,
+                id_,
+                count,
+            )
+        ):
+            return False, _("作品 {0} 数据提取失败").format(id_)
+
+        if video_only and data["作品类型"] != _("视频"):
+            return True, None
+
+        await self._deal_download_tasks(
+            data
+            | {
+                "作品链接": url,
+            },
+            namespace,
+            id_,
+            True,
+            None,
+            count,
+        )
+        self.logging(_("作品处理完成：{0}").format(id_))
+        return False, None
 
     def init_script_server(
         self,

@@ -67,6 +67,13 @@ class Html:
                 ERROR,
             )
             return ""
+        except ValueError as error:
+            logging(
+                self.print,
+                _("请求参数异常，{0} 请求失败: {1}").format(url, repr(error)),
+                ERROR,
+            )
+            return ""
 
     @staticmethod
     def format_url(url: str) -> str:
